@@ -4,6 +4,8 @@ import getopt
 import os
 import time
 import requests
+import json
+import re
 import threading
 import pyttsx3
 import random
@@ -48,6 +50,33 @@ def log_message(message):
 OLLAMA_BASE_URL = "http://localhost:11434"
 OLLAMA_MODEL = "granite3.1-moe:1b"
 
+# ================= COMMENTARY FILTERING SYSTEM =================
+# Fallback messages used when commentary is rejected
+FALLBACK_MESSAGES = [
+    "The driver pushes on, concentrating on the next corner.",
+    "Smooth progress through this section of the track.",
+    "Maintaining focus, looking for every tenth of a second.",
+    "Steady on the throttle, seeking the perfect line.",
+    "Focused and determined, pushing for consistency.",
+    "Confidence through the apex, smooth and controlled.",
+]
+
+# Profanity and inappropriate language blocklist
+PROFANITY_BLOCKLIST = [
+    "damn", "hell", "crap", "sucks", "shit", "bullshit",
+    "fuck", "ass", "bitch", "bastard", "piss", "dick",
+]
+
+# Keywords indicating hallucination (multiple drivers/rivals/teams/positions)
+HALLUCINATION_KEYWORDS = [
+    "rival", "rivals", "teammate", "teammates", "team", "teams",
+    "competitor", "competitors", "opponent", "opponents",
+    "leader", "leading", "second", "third", "fourth", "fifth",
+    "1st", "2nd", "3rd", "position battle", "battle for",
+    "chase", "chasing", "catching", "behind", "ahead",
+    "pass", "passing", "overtake", "overtaking",
+]
+
 data_size = 2**17
 
 ophelp = "Options:\n"
@@ -66,6 +95,66 @@ ophelp += " --version, -v        Show current version."
 usage = "Usage: %s [ophelp [optargs]] \n" % sys.argv[0]
 usage = usage + ophelp
 version = "20130505-2"
+
+
+def validate_commentary(commentary: str) -> tuple[bool, str]:
+    """
+    Validate commentary against formatting, hallucination, and content rules.
+    Returns: (is_valid, reason_for_rejection)
+    """
+    if not commentary or not commentary.strip():
+        return False, "Empty commentary"
+    
+    commentary_lower = commentary.lower()
+    
+    # Check for profanity
+    for bad_word in PROFANITY_BLOCKLIST:
+        if bad_word in commentary_lower:
+            return False, f"Profanity detected: '{bad_word}'"
+    
+    # Check for hallucinations (other drivers/teams/positions)
+    for keyword in HALLUCINATION_KEYWORDS:
+        if keyword in commentary_lower:
+            return False, f"Hallucination detected: mentions '{keyword}' (implying multiple drivers/teams)"
+    
+    # Check for multiple sentences (more than one period)
+    sentence_count = commentary.count(".") + commentary.count("!") + commentary.count("?")
+    if sentence_count > 1:
+        return False, f"Multiple sentences detected ({sentence_count} terminal punctuation marks)"
+    
+    # Check for word count (should be <= 15 words)
+    word_count = len(commentary.split())
+    if word_count > 15:
+        return False, f"Exceeds 15-word limit ({word_count} words)"
+    
+    # Check for list markers (-, *, numbers followed by period or dot)
+    list_markers = ["- ", "* ", " - ", " * "]
+    for marker in list_markers:
+        if marker in commentary:
+            return False, f"List marker detected: '{marker.strip()}'"
+    
+    # Check for numbered lists (1. 2. etc)
+    if re.search(r"\d+\.", commentary):
+        return False, "Numbered list detected"
+    
+    return True, ""
+
+
+def filter_commentary(commentary: str) -> str:
+    """
+    Apply validation filter to commentary. Returns filtered commentary or fallback.
+    If rejected, logs the violation and returns a random fallback message.
+    """
+    is_valid, rejection_reason = validate_commentary(commentary)
+    
+    if not is_valid:
+        fallback = random.choice(FALLBACK_MESSAGES)
+        log_message(
+            f"[FILTER REJECTED] Original: '{commentary}' | Reason: {rejection_reason} | Fallback: '{fallback}'"
+        )
+        return fallback
+    
+    return commentary
 
 
 def clip(v, lo, hi):
@@ -815,10 +904,72 @@ def get_granite_commentary(telemetry, event=None):
         )
         return data["response"].strip()
 
+    except requests.exceptions.ConnectionError as e:
+        log_message(
+            f"[LLM ERROR] ConnectionError: Ollama service unreachable at {OLLAMA_BASE_URL} - {e}"
+        )
+    except requests.exceptions.Timeout as e:
+        log_message(
+            f"[LLM ERROR] Timeout: LLM request exceeded 30-second timeout - {e}"
+        )
+    except requests.exceptions.HTTPError as e:
+        log_message(f"[LLM ERROR] HTTPError: Ollama API returned non-200 status - {e}")
+    except json.JSONDecodeError as e:
+        log_message(
+            f"[LLM ERROR] JSONDecodeError: Failed to parse Ollama response as valid JSON - {e}"
+        )
     except Exception as e:
-        print("Ollama error:", e)
+        log_message(
+            f"[LLM ERROR] Unexpected error during LLM request: {type(e).__name__} - {e}"
+        )
 
     return ""
+
+
+def rule_based_commentary(speed_kmh: float, position: str, situation: str) -> str:
+
+    # ----- STRAIGHT SITUATION -----
+    if situation == "straight":
+        if speed_kmh > 200:
+            return "Rocketing down the straight at phenomenal speed!"
+        elif speed_kmh > 150:
+            return "Down the straight, carrying excellent velocity."
+        elif speed_kmh > 100:
+            return "Making good progress on the straight."
+        else:
+            return "Cruising through the straight section."
+
+    # ----- APPROACHING CORNER -----
+    elif situation == "approaching corner":
+        if position == "left side":
+            if speed_kmh > 150:
+                return "Hard on the brakes, turning in from the left."
+            else:
+                return "Setting up for the left-hander, hugging the inside."
+        elif position == "right side":
+            if speed_kmh > 150:
+                return "Late apex approach from the right side."
+            else:
+                return "Smooth entry from the right, preparing to turn."
+        else:  # centre
+            if speed_kmh > 160:
+                return "Approaching the corner quickly, still centred."
+            else:
+                return "Steady approach, now turning in."
+
+    # ----- IN CORNER -----
+    elif situation == "in corner":
+        if speed_kmh < 80:
+            return "Very tight through the corner, nearly crawling."
+        elif speed_kmh < 120:
+            if position == "left side":
+                return "Holding the inside line, very controlled."
+            elif position == "right side":
+                return "Running a bit wide but keeping it tidy."
+            else:
+                return "Through the apex, balanced and smooth."
+        else:  # high speed in corner
+            return "Pushing hard, lots of commitment through the bend."
 
 
 # ================= MAIN DRIVE FUNCTION =================
@@ -836,9 +987,11 @@ def drive_modular(c):
 def fetch_and_log_commentary(telemetry):
     commentary = get_granite_commentary(telemetry)
     if commentary:
+        # Apply filter to commentary
+        filtered_commentary = filter_commentary(commentary)
         # Log the commentary (timestamp is added in log_message)
-        log_message(f"Commentary: {commentary}")
-        speech_queue.put(commentary)
+        log_message(f"Commentary: {filtered_commentary}")
+        speech_queue.put(filtered_commentary)
 
 
 def llm_commentary_worker():
@@ -846,8 +999,10 @@ def llm_commentary_worker():
         telemetry = llm_queue.get()
         commentary = get_granite_commentary(telemetry)
         if commentary:
-            log_message(f"Commentary: {commentary}")
-            speech_queue.put(commentary)
+            # Apply filter to commentary
+            filtered_commentary = filter_commentary(commentary)
+            log_message(f"Commentary: {filtered_commentary}")
+            speech_queue.put(filtered_commentary)
 
 
 def start_commentary_thread(telemetry):
